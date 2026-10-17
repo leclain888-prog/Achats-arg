@@ -246,6 +246,29 @@ function load(){
 }
 function save(){ DB.meta=DB.meta||{}; DB.meta.updatedAt=Date.now(); try{localStorage.setItem(KEY,JSON.stringify(DB));}catch(e){toast("⚠ Sauvegarde navigateur impossible — exportez vos données");} syncAutoPush(); }
 
+/* ---------- pièces jointes réelles (fichiers) : stockage local IndexedDB ----------
+   Les fichiers (devis signés, SWIFT, BL…) sont volumineux : on les garde dans
+   IndexedDB (plusieurs centaines de Mo possibles) et non dans localStorage (~5 Mo).
+   Seules les métadonnées (nom, type, taille, fileId) vivent dans la base synchronisée. */
+const FILES_DB="arg_files_v1",FILES_STORE="files";
+let _fdb=null;
+function filesDB(){return new Promise((res,rej)=>{if(_fdb)return res(_fdb);try{const rq=indexedDB.open(FILES_DB,1);rq.onupgradeneeded=()=>{const db=rq.result;if(!db.objectStoreNames.contains(FILES_STORE))db.createObjectStore(FILES_STORE,{keyPath:"id"});};rq.onsuccess=()=>{_fdb=rq.result;res(_fdb);};rq.onerror=()=>rej(rq.error);}catch(e){rej(e);}});}
+async function filePut(rec){const db=await filesDB();return new Promise((res,rej)=>{const tx=db.transaction(FILES_STORE,"readwrite");tx.objectStore(FILES_STORE).put(rec);tx.oncomplete=()=>res();tx.onerror=()=>rej(tx.error);});}
+async function fileGet(id){try{const db=await filesDB();return await new Promise((res,rej)=>{const tx=db.transaction(FILES_STORE,"readonly");const rq=tx.objectStore(FILES_STORE).get(id);rq.onsuccess=()=>res(rq.result||null);rq.onerror=()=>rej(rq.error);});}catch(e){return null;}}
+async function fileDel(id){if(!id)return;try{const db=await filesDB();await new Promise(res=>{const tx=db.transaction(FILES_STORE,"readwrite");tx.objectStore(FILES_STORE).delete(id);tx.oncomplete=()=>res();tx.onerror=()=>res();});}catch(e){}}
+function fileSizeTxt(n){if(n==null)return"";if(n<1024)return n+" o";if(n<1048576)return(n/1024).toFixed(0)+" Ko";return(n/1048576).toFixed(1)+" Mo";}
+// Récupère le blob : d'abord IndexedDB local, sinon télécharge depuis Supabase Storage et met en cache
+async function fileEnsureLocal(doc){
+  const rec=await fileGet(doc.fileId);if(rec&&rec.blob)return rec.blob;
+  if(doc.storagePath&&typeof stgDownload==="function"&&syncConfigured()){
+    try{toast("Téléchargement du fichier depuis le cloud…");const blob=await stgDownload(doc.storagePath);if(doc.fileId)await filePut({id:doc.fileId,blob:blob,name:doc.fileName,type:doc.fileType});return blob;}catch(e){}
+  }
+  return null;
+}
+async function fileView(doc){const blob=await fileEnsureLocal(doc);if(!blob){toast("⚠ Fichier introuvable (ni sur l'appareil, ni dans le cloud)");return;}const url=URL.createObjectURL(blob);const w=window.open(url,"_blank","noopener");if(!w){const a=document.createElement("a");a.href=url;a.target="_blank";a.rel="noopener";document.body.append(a);a.click();a.remove();}setTimeout(()=>URL.revokeObjectURL(url),120000);}
+async function fileDownload(doc){const blob=await fileEnsureLocal(doc);if(!blob){toast("⚠ Fichier introuvable");return;}const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download=doc.fileName||doc.name||"document";document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),120000);}
+async function fileShare(doc){const blob=await fileEnsureLocal(doc);if(!blob){toast("⚠ Fichier introuvable");return;}const f=new File([blob],doc.fileName||doc.name||"document",{type:blob.type||doc.fileType||"application/octet-stream"});try{if(navigator.canShare&&navigator.canShare({files:[f]})){await navigator.share({files:[f],title:doc.name||doc.fileName||"Document"});return;}}catch(e){if(e&&e.name==="AbortError")return;}toast("Partage direct indisponible sur cet appareil — téléchargement à la place");fileDownload(doc);}
+
 /* ---------- synchronisation cloud (Supabase, mono-utilisateur) ---------- */
 const SYNC={urlK:"arg_sync_url",keyK:"arg_sync_key",codeK:"arg_sync_code",autoK:"arg_sync_auto",atK:"arg_sync_at"};
 function syncCfg(){try{return {url:localStorage.getItem(SYNC.urlK)||"",key:localStorage.getItem(SYNC.keyK)||"",code:localStorage.getItem(SYNC.codeK)||"",auto:localStorage.getItem(SYNC.autoK)==="1"};}catch(e){return {url:"",key:"",code:"",auto:false};}}
@@ -289,6 +312,14 @@ async function syncPull(opts){
 }
 function syncAutoPush(){const c=syncCfg();if(!c.auto||!syncConfigured())return;clearTimeout(syncTimer);syncTimer=setTimeout(()=>syncPush(true),1500);}
 function syncBootPull(){if(syncConfigured()&&syncCfg().auto){syncPull({auto:true,silent:true});}}
+
+/* ---------- stockage cloud des fichiers (Supabase Storage) ---------- */
+const STG_BUCKET="arg-docs";
+function stgBase(c){return c.url.replace(/\/+$/,"")+"/storage/v1/object";}
+function stgKey(doc){const c=syncCfg();return (c.code?c.code.replace(/[^a-zA-Z0-9_-]/g,"")||"shared":"shared")+"/"+(doc.fileId||("f_"+uid()));}
+async function stgUpload(path,blob,type){const c=syncCfg();const r=await fetch(stgBase(c)+"/"+STG_BUCKET+"/"+path,{method:"POST",headers:Object.assign(syncHeaders(c),{"Content-Type":type||"application/octet-stream","x-upsert":"true"}),body:blob});if(!r.ok)throw new Error("storage HTTP "+r.status);return true;}
+async function stgDownload(path){const c=syncCfg();const r=await fetch(stgBase(c)+"/"+STG_BUCKET+"/"+encodeURI(path),{headers:syncHeaders(c)});if(!r.ok)throw new Error("storage HTTP "+r.status);return await r.blob();}
+async function stgDelete(path){const c=syncCfg();try{await fetch(stgBase(c)+"/"+STG_BUCKET+"/"+encodeURI(path),{method:"DELETE",headers:syncHeaders(c)});}catch(e){}}
 
 /* ---------- seed (exemples tirés de vos dossiers réels) ---------- */
 function seed(){
@@ -930,10 +961,19 @@ function docsBlock(d){
     if(!(d.docs||[]).length)tb.append(el("tr",{},el("td",{colspan:5},el("div",{class:"empty"},"Aucune pièce enregistrée. Journalisez devis, contrat, LC, preuve de paiement, BL…"))));
     (d.docs||[]).forEach(doc=>{const trr=el("tr");
       trr.append(el("td",{},el("span",{class:"pill info",style:"padding:1px 8px"},doc.type||"—")));
-      trr.append(el("td",{html:`<b>${esc(doc.name||"—")}</b>`}));
+      const nameCell=el("td",{html:`<b>${esc(doc.name||"—")}</b>`});
+      if(doc.fileId)nameCell.append(el("div",{class:"hint",style:"margin-top:3px"},"📎 "+esc(doc.fileName||"fichier")+(doc.fileSize?" · "+fileSizeTxt(doc.fileSize):"")));
+      trr.append(nameCell);
       trr.append(el("td",{},doc.date||"—"));
       trr.append(el("td",{html:`<span class="hint">${esc(doc.note||"")}</span>`}));
-      trr.append(el("td",{},el("button",{class:"btn sm",onclick:()=>docForm(d,doc,redraw)},"✎")));
+      const act=el("div",{style:"display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-end"});
+      if(doc.fileId){
+        act.append(el("button",{class:"btn sm",type:"button",title:"Aperçu",onclick:()=>fileView(doc)},"👁"));
+        act.append(el("button",{class:"btn sm",type:"button",title:"Télécharger",onclick:()=>fileDownload(doc)},"⬇"));
+        act.append(el("button",{class:"btn sm",type:"button",title:"Partager",onclick:()=>fileShare(doc)},"🔗"));
+      }
+      act.append(el("button",{class:"btn sm",type:"button",title:"Modifier",onclick:()=>docForm(d,doc,redraw)},"✎"));
+      trr.append(el("td",{},act));
       tb.append(trr);});
     t.append(tb);wrap.append(t);body.append(wrap);
     body.append(el("div",{style:"margin-top:10px"},el("button",{class:"btn sm",type:"button",onclick:()=>docForm(d,null,redraw)},"+ Ajouter une pièce")));
@@ -942,20 +982,61 @@ function docsBlock(d){
 }
 function docForm(d,doc,cb){
   const isNew=!doc;doc=doc||{id:uid(),type:"",name:"",date:"",note:""};
+  let pendingFile=null,removeFile=false;
   const ov=el("div",{style:"position:fixed;inset:0;background:rgba(0,0,0,.35);display:flex;align-items:center;justify-content:center;z-index:40;padding:20px"});
-  const card=el("div",{class:"card pad",style:"max-width:460px;width:100%;background:var(--panel)"});
+  const card=el("div",{class:"card pad",style:"max-width:460px;width:100%;background:var(--panel);max-height:92vh;overflow:auto"});
   card.append(el("h3",{style:"margin-bottom:12px"},isNew?"Nouvelle pièce":"Modifier la pièce"));
   const fg=el("div",{class:"formgrid"});
   const ty=el("select",{});{let l=DOC_TYPES.slice();if(doc.type&&!l.includes(doc.type))l=[doc.type,...l];ty.append(el("option",{value:""},"— type —"));l.forEach(x=>ty.append(el("option",{value:x,...(doc.type===x?{selected:"1"}:{})},x)));}fg.append(wrapF("Type de pièce",ty));
   const nm=el("input",{value:doc.name||"",placeholder:"N° / référence du document"});fg.append(wrapF("Intitulé / référence",nm));
   const dt=el("input",{type:"date",value:doc.date||""});fg.append(wrapF("Date du document",dt));
   const nt=el("textarea",{},doc.note||"");fg.append(wrapF("Note",nt,true));
+  // --- fichier joint réel ---
+  const fileZone=el("div",{class:"fld full"});
+  fileZone.append(el("span",{},"Fichier joint (PDF, image, Excel… max 40 Mo)"));
+  const curWrap=el("div",{style:"margin:4px 0 6px"});
+  function drawCur(){
+    curWrap.innerHTML="";
+    if(doc.fileId&&!removeFile){
+      curWrap.append(el("div",{class:"hint",style:"display:flex;align-items:center;gap:8px;flex-wrap:wrap"},
+        el("span",{},"📎 "+(doc.fileName||"fichier")+(doc.fileSize?" · "+fileSizeTxt(doc.fileSize):"")),
+        el("button",{class:"btn sm",type:"button",onclick:()=>fileView(doc)},"👁 Aperçu"),
+        el("button",{class:"btn sm",type:"button",onclick:()=>fileDownload(doc)},"⬇"),
+        el("button",{class:"btn sm danger",type:"button",onclick:()=>{removeFile=true;pendingFile=null;drawCur();}},"Retirer")));
+    }else if(pendingFile){
+      curWrap.append(el("div",{class:"hint",style:"color:var(--ok,#16a34a)"},"➕ "+pendingFile.name+" · "+fileSizeTxt(pendingFile.size)+" — sera enregistré"));
+    }else if(removeFile&&doc.fileName){
+      curWrap.append(el("div",{class:"hint",style:"color:var(--bad,#dc2626)"},"🗑 "+doc.fileName+" sera retiré"));
+    }else{
+      curWrap.append(el("div",{class:"hint"},"Aucun fichier joint."));
+    }
+  }
+  const fileIn=el("input",{type:"file"});
+  fileIn.addEventListener("change",()=>{const f=fileIn.files&&fileIn.files[0];if(!f)return;if(f.size>40*1048576){toast("⚠ Fichier trop volumineux (max 40 Mo)");fileIn.value="";return;}pendingFile=f;removeFile=false;drawCur();});
+  drawCur();fileZone.append(curWrap,fileIn);fg.append(fileZone);
   card.append(fg);
   card.append(el("div",{style:"display:flex;gap:8px;justify-content:space-between;margin-top:14px"},
-    isNew?el("span",{}):el("button",{class:"btn sm danger",onclick:()=>{d.docs=d.docs.filter(x=>x.id!==doc.id);ov.remove();cb();}},"Supprimer"),
+    isNew?el("span",{}):el("button",{class:"btn sm danger",onclick:async()=>{if(doc.fileId)await fileDel(doc.fileId);if(doc.storagePath&&syncConfigured())await stgDelete(doc.storagePath);d.docs=d.docs.filter(x=>x.id!==doc.id);ov.remove();cb();}},"Supprimer"),
     el("div",{style:"display:flex;gap:8px"},
-      el("button",{class:"btn",onclick:()=>ov.remove()},"Annuler"),
-      el("button",{class:"btn pri",onclick:()=>{doc.type=ty.value;doc.name=nm.value;doc.date=dt.value;doc.note=nt.value;if(isNew){d.docs=d.docs||[];d.docs.push(doc);}ov.remove();cb();}},"Enregistrer"))));
+      el("button",{class:"btn",type:"button",onclick:()=>ov.remove()},"Annuler"),
+      el("button",{class:"btn pri",type:"button",onclick:async(e)=>{
+        const btn=e.target;btn.disabled=true;btn.textContent="…";
+        doc.type=ty.value;doc.name=nm.value;doc.date=dt.value;doc.note=nt.value;
+        try{
+          if(removeFile&&doc.fileId){await fileDel(doc.fileId);if(doc.storagePath&&syncConfigured())await stgDelete(doc.storagePath);doc.fileId=null;doc.fileName="";doc.fileType="";doc.fileSize=null;doc.storagePath="";}
+          if(pendingFile){
+            const fid=doc.fileId||("f_"+uid());
+            await filePut({id:fid,blob:pendingFile,name:pendingFile.name,type:pendingFile.type});
+            doc.fileId=fid;doc.fileName=pendingFile.name;doc.fileType=pendingFile.type;doc.fileSize=pendingFile.size;
+            if(syncConfigured()){
+              try{btn.textContent="envoi cloud…";const key=stgKey(doc);await stgUpload(key,pendingFile,pendingFile.type);doc.storagePath=key;}
+              catch(err2){doc.storagePath="";toast("⚠ Gardé en local mais non envoyé au cloud : "+(err2&&err2.message||err2));}
+            }
+          }
+        }catch(err){toast("⚠ Fichier non enregistré : "+(err&&err.message||err));btn.disabled=false;btn.textContent="Enregistrer";return;}
+        if(isNew){d.docs=d.docs||[];d.docs.push(doc);}
+        ov.remove();cb();toast("Pièce enregistrée — cliquez « Enregistrer » le dossier pour confirmer");
+      }},"Enregistrer"))));
   ov.append(card);document.body.append(ov);
 }
 function offerForm(d,o,cb){
@@ -1136,8 +1217,10 @@ function renderSettings(v,A){
     "2. Dans le projet : menu <b>SQL Editor</b> → collez et exécutez :<br>"+
     "<code style='display:block;white-space:pre-wrap;background:var(--panel-2);padding:8px;border-radius:6px;margin:6px 0'>create table if not exists arg_sync (\n  code text primary key,\n  data jsonb,\n  updated_at timestamptz default now()\n);\nalter table arg_sync enable row level security;\ncreate policy \"anon all\" on arg_sync for all to anon using (true) with check (true);</code>"+
     "3. Menu <b>Project Settings → API</b> : copiez <b>Project URL</b> (champ URL ci-dessus) et la clé <b>anon public</b> (champ Clé).<br>"+
-    "4. Mettez le <b>même code secret</b> sur vos 3 appareils, activez l'auto, et enregistrez.<br>"+
-    "⚠ La sécurité repose sur votre code secret : gardez-le privé et utilisez le bouton « Générer » pour un code long."}));
+    "4. <b>Pour les pièces jointes (devis, SWIFT, BL… partagés entre appareils)</b> : menu <b>Storage</b> → <b>New bucket</b> → nom exact <code>arg-docs</code>, laissez « Public » <b>désactivé</b>. Puis <b>SQL Editor</b> → exécutez :<br>"+
+    "<code style='display:block;white-space:pre-wrap;background:var(--panel-2);padding:8px;border-radius:6px;margin:6px 0'>create policy \"arg docs read\"   on storage.objects for select to anon using (bucket_id = 'arg-docs');\ncreate policy \"arg docs write\"  on storage.objects for insert to anon with check (bucket_id = 'arg-docs');\ncreate policy \"arg docs update\" on storage.objects for update to anon using (bucket_id = 'arg-docs');\ncreate policy \"arg docs delete\" on storage.objects for delete to anon using (bucket_id = 'arg-docs');</code>"+
+    "5. Mettez le <b>même code secret</b> sur vos 3 appareils, activez l'auto, et enregistrez.<br>"+
+    "⚠ La sécurité repose sur votre code secret : gardez-le privé et utilisez le bouton « Générer » pour un code long. Les fichiers joints après configuration sont envoyés dans le bucket <code>arg-docs</code> et retéléchargés automatiquement sur vos autres appareils."}));
   cS.append(help);
   v.append(cS);
 
@@ -1188,11 +1271,18 @@ function importMerge(payload){
     const existing=inc.ref?DB.dossiers.find(x=>(x.ref||"")===inc.ref):null;
     if(existing){
       const incOffers=inc.offers;delete inc.offers;
+      const incDocs=inc.docs;delete inc.docs;
       Object.keys(inc).forEach(k=>{if(k!=="id")existing[k]=inc[k];});
       if(incOffers){existing.offers=existing.offers||[];incOffers.forEach(o=>{const ex=existing.offers.find(e=>e.supplierId===o.supplierId);if(ex){Object.keys(o).forEach(k=>{if(k!=="id")ex[k]=o[k];});}else{o.id=uid();existing.offers.push(o);}});}
+      // fusion des pièces par id (ou type+intitulé) en PRÉSERVANT les fichiers déjà joints sur l'appareil
+      if(incDocs){existing.docs=existing.docs||[];incDocs.forEach(nd=>{
+        const ex=existing.docs.find(e=>(nd.id&&e.id===nd.id)||((e.type||"")===(nd.type||"")&&(e.name||"")===(nd.name||"")));
+        if(ex){const keep={fileId:ex.fileId,fileName:ex.fileName,fileType:ex.fileType,fileSize:ex.fileSize,storagePath:ex.storagePath};Object.keys(nd).forEach(k=>{if(k!=="id")ex[k]=nd[k];});["fileId","fileName","fileType","fileSize","storagePath"].forEach(k=>{if(nd[k]==null&&keep[k]!=null)ex[k]=keep[k];});}
+        else{nd.id=nd.id||uid();existing.docs.push(nd);}
+      });}
       updated++;
     }else{
-      inc.id=uid();(inc.offers||[]).forEach(o=>o.id=uid());DB.dossiers.unshift(inc);added++;
+      inc.id=uid();(inc.offers||[]).forEach(o=>o.id=uid());(inc.docs||[]).forEach(dc=>{dc.id=dc.id||uid();});DB.dossiers.unshift(inc);added++;
     }
   });
   let addedTasks=0;
