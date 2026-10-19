@@ -475,6 +475,7 @@ function toggleTask(date,key,val){DB.meta=DB.meta||{};DB.meta.done=DB.meta.done|
 function taskPrioPill(p){return el("span",{class:"pill "+p,style:"padding:1px 8px"},p==="crit"?"Urgent":p==="warn"?"À faire":"À suivre");}
 /* ---- tâches personnelles ---- */
 const TASK_STATUS=["À faire","En cours","En attente","Terminé"];
+const TASK_TEMPLATES=["Envoyer le devis approuvé en paiement","Récupérer le SWIFT de l'acompte","Demander le draft de la LC","Vérifier que le paiement est bien reçu (et agir en conséquence)","Suivre l'état d'avancement de la production","Demander / vérifier le booking","Suivre les conteneurs (expédition)","Suivre les opérations au port / déchargement","Clôturer le dossier (si aucune réclamation)","Relancer le fournisseur pour cotation","Demander la confirmation / mise à jour du devis"];
 let taskFilter={status:"ouvertes",ref:"",sort:"prio"};
 function getTasks(){DB.meta=DB.meta||{};if(!Array.isArray(DB.meta.tasks))DB.meta.tasks=[];return DB.meta.tasks;}
 function taskOpenCount(){return getTasks().filter(x=>x.status!=="Terminé").length;}
@@ -549,7 +550,7 @@ function taskRow(x){
   let dueHtml="";if(x.due){const dd=daysBetween(todayISO(),x.due);const c=done?"mut":dd<0?"crit":dd<=1?"warn":"mut";dueHtml=` <span class="pill ${c}" style="padding:1px 8px">⏱ ${esc(x.due)}${!done&&dd<0?" (en retard)":""}</span>`;}
   body.append(el("div",{style:"display:flex;gap:7px;align-items:center;flex-wrap:wrap;margin-bottom:3px",html:taskStatusPill(x.status)+" "+prioPill+dueHtml}));
   body.append(el("div",{style:"font-weight:600"+(done?";text-decoration:line-through":"")},x.title||"(sans titre)"));
-  const meta=[x.dossierRef,x.entity].filter(Boolean).join(" · ");
+  const spn=x.supplierId?supName(x.supplierId):"";const meta=[x.dossierRef,(spn&&spn!=="—")?spn:"",x.entity].filter(Boolean).join(" · ");
   if(meta)body.append(el("div",{class:"hint"},meta));
   if(x.note)body.append(el("div",{class:"hint",style:"margin-top:3px;white-space:pre-wrap;color:var(--fg)"},x.note));
   const rightCol=el("div",{style:"display:flex;flex-direction:column;gap:5px;align-items:flex-end"});
@@ -568,6 +569,8 @@ function taskForm(task){
   m.append(el("div",{class:"mh"},el("h3",{},isNew?"Nouvelle tâche":"Modifier la tâche"),el("div",{class:"grow"}),el("button",{class:"xbtn",onclick:closeModal},"×")));
   const b=el("div",{class:"mb"});const fg=el("div",{class:"formgrid"});
   const ti=el("input",{value:task.title||"",placeholder:"Ex. Relancer Emily Wang (CNBM) pour date ferme"});fg.append(wrapF("Intitulé de la tâche",ti,true));
+  const sp=el("select",{});sp.append(el("option",{value:""},"— aucun —"));DB.suppliers.filter(s=>!s.hidden).forEach(s=>sp.append(el("option",{value:s.id,...(task.supplierId===s.id?{selected:"1"}:{})},s.name)));fg.append(wrapF("Fournisseur lié (optionnel)",sp));
+  const tpl=el("select",{onchange:e=>{if(e.target.value){const sName=sp.value?(supName(sp.value)||""):"";ti.value=e.target.value+(sName?" — "+sName:"");e.target.value="";}}});tpl.append(el("option",{value:""},"— insérer une tâche type —"));TASK_TEMPLATES.forEach(x=>tpl.append(el("option",{value:x},x)));fg.append(wrapF("Tâches génériques (remplit l'intitulé)",tpl,true));
   const st=el("select",{});TASK_STATUS.forEach(s=>st.append(el("option",{value:s,...(task.status===s?{selected:"1"}:{})},s)));fg.append(wrapF("État d'avancement",st));
   const pr=el("select",{});["Haute","Normale","Basse"].forEach(s=>pr.append(el("option",{value:s,...(task.priority===s?{selected:"1"}:{})},s)));fg.append(wrapF("Priorité",pr));
   const du=el("input",{type:"date",value:task.due||""});fg.append(wrapF("Échéance",du));
@@ -576,7 +579,7 @@ function taskForm(task){
   b.append(fg);
   b.append(el("div",{style:"display:flex;gap:10px;justify-content:flex-end;margin-top:16px"},
     el("button",{class:"btn",onclick:closeModal},"Annuler"),
-    el("button",{class:"btn pri",onclick:()=>{task.title=ti.value.trim();task.status=st.value;task.priority=pr.value;task.due=du.value;task.dossierRef=dr.value;task.note=nt.value;const d=DB.dossiers.find(x=>x.ref===task.dossierRef);task.entity=d?dossEntity(d):"";if(!task.title){toast("Donnez un intitulé à la tâche");return;}if(isNew)getTasks().unshift(task);save();closeModal();go("morning");toast("Tâche enregistrée");}},"Enregistrer")));
+    el("button",{class:"btn pri",onclick:()=>{task.title=ti.value.trim();task.status=st.value;task.priority=pr.value;task.due=du.value;task.dossierRef=dr.value;task.supplierId=sp.value;task.note=nt.value;const d=DB.dossiers.find(x=>x.ref===task.dossierRef);task.entity=d?dossEntity(d):"";if(!task.title){toast("Donnez un intitulé à la tâche");return;}if(isNew)getTasks().unshift(task);save();closeModal();go("morning");toast("Tâche enregistrée");}},"Enregistrer")));
   m.append(b);openModal();
 }
 
@@ -838,8 +841,8 @@ const SECTIONS=[
   {t:"Réception & conformité",f:[F("Date réception","receivedDate","date"),F("Conformité","conformity","select",["","Conforme","Réserves","Non conforme"]),F("Inspection par","inspectionBy")]},
   {t:"Clôture / classement sans suite",f:[F("Statut du dossier","state","select",STATES),F("Date de clôture / classement","closedDate","date"),F("Motif (clôture ou classement sans suite)","closedReason")]},
 ];
-function editDossier(id){
-  let d=id?JSON.parse(JSON.stringify(DB.dossiers.find(x=>x.id===id))):{id:uid(),ref:nextRef(),title:"",entity:"AL RAJA GROUP",stage:"Prospection",priority:"Moyenne",currency:"USD",createdDate:todayISO(),offers:[],notes:""};
+function editDossier(id,seed){
+  let d=id?JSON.parse(JSON.stringify(DB.dossiers.find(x=>x.id===id))):Object.assign({id:uid(),ref:nextRef(),title:"",entity:"AL RAJA GROUP",stage:"Prospection",priority:"Moyenne",currency:"USD",createdDate:todayISO(),offers:[],notes:""},seed||{});
   const isNew=!id;
   const m=$("#modal");m.innerHTML="";
   m.append(el("div",{class:"mh"},el("h3",{},isNew?"Nouveau dossier":("Dossier "+esc(d.ref))),
@@ -1093,7 +1096,8 @@ function renderSuppliers(v,A){
     {key:"contact",label:"Contact",render:s=>`${esc(s.contact||"—")}<div class="hint">${esc(s.email||"")} ${s.phone?("· "+esc(s.phone)):""}</div>`},
     {key:"status",label:"Statut",render:s=>{const c=s.status==="Approuvé"?"ok":s.status==="Blacklisté"?"crit":"warn";return `<span class="pill ${c}">${esc(s.status||"—")}</span>`;}},
     {key:"rating",label:"Éval.",num:true,render:s=>s.rating?("★".repeat(Math.round(s.rating))):"—",sort:s=>Number(s.rating)||0},
-    {key:"act",label:"",render:s=>el("div",{style:"display:flex;gap:6px;justify-content:flex-end"},
+    {key:"act",label:"",render:s=>el("div",{style:"display:flex;gap:6px;justify-content:flex-end;flex-wrap:wrap"},
+      el("button",{class:"btn sm",title:"Créer un dossier d'achat depuis ce fournisseur",onclick:(e)=>{e.stopPropagation();dossierFromSupplier(s.id);}},"➕ Dossier"),
       el("button",{class:"btn sm",onclick:(e)=>{e.stopPropagation();toggleSupplierHidden(s.id);}},s.hidden?"Afficher":"Masquer"),
       el("button",{class:"btn sm",onclick:(e)=>{e.stopPropagation();editSupplier(s.id);}},"Ouvrir"))},
   ];
@@ -1115,8 +1119,25 @@ function editSupplier(id){
   b.append(fg);
   b.append(el("div",{style:"display:flex;gap:10px;justify-content:flex-end;margin-top:16px"},
     el("button",{class:"btn",onclick:closeModal},"Annuler"),
+    isNew?el("span",{}):el("button",{class:"btn",onclick:()=>dossierFromSupplier(s.id),title:"Ouvrir un nouveau dossier d'achat avec ce fournisseur déjà renseigné"},"➕ Créer un dossier d'achat"),
+    el("button",{class:"btn",onclick:closeModal},"Annuler"),
     el("button",{class:"btn pri",onclick:()=>{for(const k in inputs)s[k]=inputs[k].value;s.rating=Number(s.rating)||0;if(isNew)DB.suppliers.unshift(s);else{const i=DB.suppliers.findIndex(x=>x.id===s.id);DB.suppliers[i]=s;}save();closeModal();render();toast("Fournisseur enregistré");}},"Enregistrer")));
   m.append(b);openModal();
+}
+// Crée rapidement un dossier d'achat pré-rempli à partir d'un fournisseur existant
+function dossierFromSupplier(supId){
+  const s=DB.suppliers.find(x=>x.id===supId);if(!s){toast("Fournisseur introuvable");return;}
+  closeModal();
+  editDossier(null,{
+    title:"",
+    category:s.category||"",
+    stage:"Cotation envoyée",
+    currency:"USD",
+    offers:[{id:uid(),supplierId:supId,price:null,currency:"USD",incoterm:"",leadTime:"",validity:"",compliant:"?",score:0,notes:"Offre initiale — "+(s.name||"")}],
+    selectedSupplierId:"",
+    notes:"Dossier ouvert depuis le fournisseur "+(s.name||"")+"."
+  });
+  toast("Nouveau dossier pré-rempli avec "+(s.name||"")+" — complétez puis Enregistrez");
 }
 
 /* ============================================================
